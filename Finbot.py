@@ -6,6 +6,8 @@ import yfinance as yf
 from datetime import date, timedelta
 import re
 import requests
+import time
+import random
 from transformers import pipeline  # For local Hugging Face models
 
 # Set page configuration
@@ -14,6 +16,93 @@ st.set_page_config(
     page_icon="💰",
     layout="wide"
 )
+
+# Enhanced Stock Data Manager Class
+class StockDataManager:
+    def __init__(self):
+        self.request_delay = 1.5  # Base delay between requests
+        self.max_retries = 3
+        self.backoff_factor = 2
+        self.last_request_time = 0
+        
+    def wait_for_rate_limit(self):
+        """Implement smart rate limiting"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        if time_since_last < self.request_delay:
+            sleep_time = self.request_delay - time_since_last
+            time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
+    
+    def get_stock_data_with_retry(self, ticker, period="1y"):
+        """Fetch stock data with exponential backoff retry logic"""
+        for attempt in range(self.max_retries):
+            try:
+                # Wait before making request
+                self.wait_for_rate_limit()
+                
+                # Add random jitter to avoid synchronized requests
+                if attempt > 0:
+                    jitter = random.uniform(0.5, 1.5)
+                    time.sleep(attempt * self.backoff_factor + jitter)
+                
+                stock = yf.Ticker(ticker)
+                
+                # Get historical data
+                history = stock.history(period=period)
+                if history.empty:
+                    st.warning(f"No historical data available for {ticker}")
+                    return None
+                
+                # Try to get financial statements (these are often rate limited)
+                try:
+                    income_statement = stock.income_stmt
+                    balance_sheet = stock.balance_sheet
+                    cash_flow = stock.cashflow
+                    info = stock.info
+                except Exception as financial_error:
+                    st.warning(f"Some financial data for {ticker} unavailable: Limited data will be shown")
+                    income_statement = pd.DataFrame()
+                    balance_sheet = pd.DataFrame()
+                    cash_flow = pd.DataFrame()
+                    info = {}
+                
+                return {
+                    "history": history,
+                    "income_statement": income_statement,
+                    "balance_sheet": balance_sheet,
+                    "cash_flow": cash_flow,
+                    "info": info
+                }
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                
+                if "too many requests" in error_msg or "rate limit" in error_msg:
+                    wait_time = (2 ** attempt) * self.backoff_factor + random.uniform(1, 3)
+                    st.warning(f"Rate limited for {ticker}. Waiting {wait_time:.1f} seconds before retry {attempt + 1}/{self.max_retries}")
+                    time.sleep(wait_time)
+                    continue
+                elif "not found" in error_msg or "invalid" in error_msg:
+                    st.error(f"Ticker {ticker} not found")
+                    return None
+                else:
+                    if attempt < self.max_retries - 1:
+                        st.warning(f"Error fetching {ticker}: {e}. Retrying...")
+                        time.sleep((attempt + 1) * 2)
+                        continue
+                    st.error(f"Error fetching {ticker}: {e}")
+                    return None
+        
+        st.error(f"Failed to fetch data for {ticker} after {self.max_retries} attempts")
+        return None
+
+# Initialize the stock data manager
+@st.cache_resource
+def get_stock_manager():
+    return StockDataManager()
 
 # Define navigation
 st.sidebar.title("Navigation")
@@ -66,7 +155,7 @@ if page == "Stock Analysis":
     
     if currency_option != st.session_state.currency:
         st.session_state.currency = currency_option
-        st.experimental_rerun()
+        st.rerun()
 
 # Global variables to store user data
 if 'user_data' not in st.session_state:
@@ -197,78 +286,97 @@ def plot_pie_chart():
     return fig
 
 #####################################
-# Stock Analysis Functions
+# Enhanced Stock Analysis Functions
 #####################################
-
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def get_stock_data(ticker, period="1y"):
-    """Fetches stock data for the given ticker."""
-    try:
-        stock = yf.Ticker(ticker)
-        history = stock.history(period=period)
-        
-        if history.empty:
-            return None
-            
-        # Financial statements
-        income_statement = stock.income_stmt
-        balance_sheet = stock.balance_sheet
-        cash_flow = stock.cashflow
-        
-        return {
-            "history": history,
-            "income_statement": income_statement,
-            "balance_sheet": balance_sheet,
-            "cash_flow": cash_flow
-        }
-    except Exception as e:
-        st.error(f"Error fetching data for {ticker}: {e}")
-        return None
+    """Enhanced stock data fetching with retry logic and rate limiting."""
+    manager = get_stock_manager()
+    return manager.get_stock_data_with_retry(ticker, period)
 
 def calculate_financial_metrics(stock_data):
-    """Calculate key financial metrics from stock data."""
+    """Enhanced financial metrics calculation with better error handling."""
     metrics = {}
     
     if stock_data is None:
         return metrics
     
-    # Price metrics
+    # Price metrics from history
     history = stock_data["history"]
     if not history.empty:
-        current_price = history['Close'].iloc[-1]
-        metrics["Current Price"] = round(current_price, 2)
-        
-        # Calculate price growth if we have enough data
-        if len(history) > 20:
-            start_price = history['Close'].iloc[0]
-            price_change = ((current_price - start_price) / start_price) * 100
-            metrics["Price Change (%)"] = round(price_change, 2)
+        try:
+            current_price = history['Close'].iloc[-1]
+            metrics["Current Price"] = round(current_price, 2)
+            
+            # Calculate price change if we have enough data
+            if len(history) > 20:
+                start_price = history['Close'].iloc[0]
+                price_change = ((current_price - start_price) / start_price) * 100
+                metrics["Price Change (%)"] = round(price_change, 2)
+                
+                # 52-week high/low
+                high_52week = history['High'].max()
+                low_52week = history['Low'].min()
+                metrics["52W High"] = round(high_52week, 2)
+                metrics["52W Low"] = round(low_52week, 2)
+                
+                # Average volume
+                avg_volume = history['Volume'].mean()
+                metrics["Avg Volume"] = int(avg_volume)
+                
+        except Exception as e:
+            st.warning(f"Error calculating price metrics: {e}")
     
-    # Income statement metrics
+    # Company info metrics (if available)
+    info = stock_data.get("info", {})
+    if info:
+        try:
+            # Market cap
+            if 'marketCap' in info and info['marketCap']:
+                metrics["Market Cap"] = info['marketCap']
+            
+            # P/E ratio
+            if 'trailingPE' in info and info['trailingPE']:
+                metrics["P/E Ratio"] = round(info['trailingPE'], 2)
+            
+            # Dividend yield
+            if 'dividendYield' in info and info['dividendYield']:
+                metrics["Dividend Yield (%)"] = round(info['dividendYield'] * 100, 2)
+                
+            # Beta
+            if 'beta' in info and info['beta']:
+                metrics["Beta"] = round(info['beta'], 2)
+                
+        except Exception as e:
+            pass  # Info data is optional
+    
+    # Financial statement metrics (if available)
     income = stock_data["income_statement"]
     balance = stock_data["balance_sheet"]
     
     if not income.empty and not balance.empty:
-        # Use the most recent annual data
         try:
-            # Get latest year data
+            # Use the most recent annual data
             latest_income = income.iloc[:, 0]
             latest_balance = balance.iloc[:, 0]
             
-            # Calculation of metrics
-            if 'Total Revenue' in latest_income and 'Net Income' in latest_income:
+            # Revenue and Net Income
+            if 'Total Revenue' in latest_income:
                 revenue = latest_income['Total Revenue']
-                net_income = latest_income['Net Income']
-                
                 metrics["Revenue"] = revenue
-                metrics["Net Income"] = net_income
                 
-                # Net Margin
-                if revenue > 0:
-                    net_margin = (net_income / revenue) * 100
-                    metrics["Net Margin (%)"] = round(net_margin, 2)
+                if 'Net Income' in latest_income:
+                    net_income = latest_income['Net Income']
+                    metrics["Net Income"] = net_income
+                    
+                    # Net Margin
+                    if revenue > 0:
+                        net_margin = (net_income / revenue) * 100
+                        metrics["Net Margin (%)"] = round(net_margin, 2)
             
             # ROE
             if 'Net Income' in latest_income and 'Total Stockholder Equity' in latest_balance:
+                net_income = latest_income['Net Income']
                 equity = latest_balance['Total Stockholder Equity']
                 if equity > 0:
                     roe = (net_income / equity) * 100
@@ -277,12 +385,13 @@ def calculate_financial_metrics(stock_data):
             # Debt-to-Equity
             if 'Total Debt' in latest_balance and 'Total Stockholder Equity' in latest_balance:
                 debt = latest_balance.get('Total Debt', 0)
+                equity = latest_balance['Total Stockholder Equity']
                 if equity > 0:
                     debt_to_equity = (debt / equity) * 100
                     metrics["Debt-to-Equity (%)"] = round(debt_to_equity, 2)
         
         except Exception as e:
-            st.warning(f"Could not calculate all metrics: {e}")
+            pass  # Financial statement data is optional
     
     return metrics
 
@@ -347,6 +456,12 @@ def get_stock_recommendations(metrics_list, tickers):
             # Lower D/E is better, penalize high debt
             score -= min(dte / 10, 15)
         
+        # P/E ratio score (moderate P/E is better)
+        if "P/E Ratio" in metrics:
+            pe = metrics["P/E Ratio"]
+            if 0 < pe < 50:  # Reasonable P/E range
+                score += max(10 - abs(pe - 20) / 5, 0)
+        
         scored_stocks.append((ticker, round(score, 2), metrics))
     
     # Sort by score (highest first)
@@ -359,7 +474,7 @@ def allocate_investment(recommendations, investment_amount):
     if not recommendations:
         return {}
     
-    # Number of stocks to invest in (top 5 or all if less than 3)
+    # Number of stocks to invest in (top 5 or all if less than 5)
     num_stocks = min(5, len(recommendations))
     top_stocks = recommendations[:num_stocks]
     
@@ -381,6 +496,34 @@ def allocate_investment(recommendations, investment_amount):
             }
     
     return allocation
+
+def batch_stock_analysis(tickers, progress_callback=None):
+    """Analyze multiple stocks with proper rate limiting and progress tracking"""
+    results = []
+    all_metrics = []
+    valid_tickers = []
+    
+    for i, ticker in enumerate(tickers):
+        if progress_callback:
+            progress_callback((i + 1) / len(tickers))
+        
+        stock_data = get_stock_data(ticker)
+        
+        if stock_data:
+            metrics = calculate_financial_metrics(stock_data)
+            if metrics:
+                all_metrics.append(metrics)
+                valid_tickers.append(ticker)
+                st.success(f"✅ {ticker} - Analysis complete")
+            else:
+                st.warning(f"⚠️ {ticker} - Limited data available")
+        else:
+            st.error(f"❌ {ticker} - Failed to fetch data")
+        
+        # Small delay between stocks to be respectful
+        time.sleep(0.2)
+    
+    return all_metrics, valid_tickers
 
 #####################################
 # Financial Advisor Chat with Open Source LLM
@@ -442,7 +585,6 @@ def get_financial_advice_llm(query):
     except Exception as e:
         st.error(f"Error with LLM service: {e}")
         return "I'm sorry, I couldn't process your request due to a technical issue. Please try again or ask a different question."
-
 
 #####################################
 # Page Content
